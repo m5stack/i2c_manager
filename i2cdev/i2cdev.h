@@ -1,5 +1,4 @@
 /*
-
 SPDX-License-Identifier: MIT
 
 MIT License
@@ -23,32 +22,32 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
 */
-
 
 #ifndef __I2CDEV_H__
 #define __I2CDEV_H__
 
-#include <driver/i2c.h>
+#include "driver/i2c_master.h"
+#include "hal/i2c_types.h"
 #include <esp_err.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-
-// i2cdev-compatible I2C device descriptor.
-// Everything but the port and addr is ignored, port properties handled by I2C Manager
+// i2cdev-compatible I2C device descriptor for ESP-IDF v5.x
 typedef struct
 {
     i2c_port_t port;
-    i2c_config_t cfg;
     uint8_t addr;
+    i2c_master_dev_handle_t dev_handle;  // 新的设备句柄
     SemaphoreHandle_t mutex;
     uint32_t timeout_ticks;
 } i2c_dev_t;
 
+// 函数声明
 esp_err_t i2cdev_init();
 esp_err_t i2cdev_done();
 esp_err_t i2c_dev_create_mutex(i2c_dev_t *dev);
@@ -65,12 +64,12 @@ esp_err_t i2c_dev_write_reg(const i2c_dev_t *dev, uint8_t reg,
         const void *out_data, size_t out_size);
 
 #define I2C_DEV_TAKE_MUTEX(dev) do { \
-        esp_err_t __ = ESP_OK; \
+        esp_err_t __ = i2c_dev_take_mutex(dev); \
         if (__ != ESP_OK) return __;\
     } while (0)
 
 #define I2C_DEV_GIVE_MUTEX(dev) do { \
-        esp_err_t __ = ESP_OK; \
+        esp_err_t __ = i2c_dev_give_mutex(dev); \
         if (__ != ESP_OK) return __;\
     } while (0)
 

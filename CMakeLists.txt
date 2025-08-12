@@ -9,4 +9,6 @@ endif()
 idf_component_register(
     SRCS ${SOURCES}
     INCLUDE_DIRS ${INCLUDES}
+    REQUIRES driver esp_common freertos log esp_driver_i2c
+    PRIV_REQUIRES ""
 )

@@ -1,368 +1,564 @@
 /*
-
-SPDX-License-Identifier: MIT
-
-MIT License
-
-Copyright (c) 2021 Rop Gonggrijp. Based on esp_i2c_helper by Mika Tuupola.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-*/
+ * I2C Manager for ESP-IDF 5.4.1+
+ * Using new I2C Master Driver API
+ */
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
-#include <esp_log.h>
-
+#include "esp_log.h"
+#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include <driver/i2c.h>
+#include "driver/i2c_master.h"
 
 #include "sdkconfig.h"
-
 #include "i2c_manager.h"
-
-
-#if defined __has_include
-	#if __has_include ("esp_idf_version.h")
-		#include "esp_idf_version.h"
-		#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 3, 0)
-			#define HAS_CLK_FLAGS
-		#endif
-	#endif
-#endif
-
 
 static const char* TAG = I2C_TAG;
 
-static SemaphoreHandle_t I2C_FN(_local_mutex)[2] = { NULL, NULL };
-static SemaphoreHandle_t* I2C_FN(_mutex) = &I2C_FN(_local_mutex)[0];
+// I2C管理器实例
+static i2c_manager_t i2c_managers[I2C_NUM_MAX] = {0};
 
-static const uint8_t ACK_CHECK_EN = 1;
-
-#if defined (I2C_NUM_0) && defined (CONFIG_I2C_MANAGER_0_ENABLED)
-	#define I2C_ZERO 					I2C_NUM_0
-	#if defined (CONFIG_I2C_MANAGER_0_PULLUPS)
-		#define I2C_MANAGER_0_PULLUPS 	true
-	#else
-		#define I2C_MANAGER_0_PULLUPS 	false
-	#endif
-
-	#define I2C_MANAGER_0_TIMEOUT 		( CONFIG_I2C_MANAGER_0_TIMEOUT / portTICK_RATE_MS )
-	#define I2C_MANAGER_0_LOCK_TIMEOUT	( CONFIG_I2C_MANAGER_0_LOCK_TIMEOUT / portTICK_RATE_MS )
+// 配置定义
+#ifdef CONFIG_I2C_MANAGER_0_ENABLED
+    #define I2C_ZERO
+    #ifndef CONFIG_I2C_MANAGER_0_SDA
+        #define CONFIG_I2C_MANAGER_0_SDA 21
+    #endif
+    #ifndef CONFIG_I2C_MANAGER_0_SCL
+        #define CONFIG_I2C_MANAGER_0_SCL 22
+    #endif
+    #ifndef CONFIG_I2C_MANAGER_0_FREQ_HZ
+        #define CONFIG_I2C_MANAGER_0_FREQ_HZ 400000
+    #endif
+    #ifndef CONFIG_I2C_MANAGER_0_TIMEOUT
+        #define CONFIG_I2C_MANAGER_0_TIMEOUT 20
+    #endif
+    #ifndef CONFIG_I2C_MANAGER_0_LOCK_TIMEOUT
+        #define CONFIG_I2C_MANAGER_0_LOCK_TIMEOUT 50
+    #endif
 #endif
 
-
-#if defined (I2C_NUM_1) && defined (CONFIG_I2C_MANAGER_1_ENABLED)
-	#define I2C_ONE 					I2C_NUM_1
-	#if defined (CONFIG_I2C_MANAGER_1_PULLUPS)
-		#define I2C_MANAGER_1_PULLUPS 	true
-	#else
-		#define I2C_MANAGER_1_PULLUPS 	false
-	#endif
-
-	#define I2C_MANAGER_1_TIMEOUT 		( CONFIG_I2C_MANAGER_1_TIMEOUT / portTICK_RATE_MS )
-	#define I2C_MANAGER_1_LOCK_TIMEOUT	( CONFIG_I2C_MANAGER_1_LOCK_TIMEOUT / portTICK_RATE_MS )
+#ifdef CONFIG_I2C_MANAGER_1_ENABLED
+    #define I2C_ONE
+    #ifndef CONFIG_I2C_MANAGER_1_SDA
+        #define CONFIG_I2C_MANAGER_1_SDA 18
+    #endif
+    #ifndef CONFIG_I2C_MANAGER_1_SCL
+        #define CONFIG_I2C_MANAGER_1_SCL 19
+    #endif
+    #ifndef CONFIG_I2C_MANAGER_1_FREQ_HZ
+        #define CONFIG_I2C_MANAGER_1_FREQ_HZ 400000
+    #endif
+    #ifndef CONFIG_I2C_MANAGER_1_TIMEOUT
+        #define CONFIG_I2C_MANAGER_1_TIMEOUT 20
+    #endif
+    #ifndef CONFIG_I2C_MANAGER_1_LOCK_TIMEOUT
+        #define CONFIG_I2C_MANAGER_1_LOCK_TIMEOUT 50
+    #endif
 #endif
 
+// 超时定义
+#ifdef I2C_ZERO
+    #define I2C_MANAGER_0_TIMEOUT_TICKS (CONFIG_I2C_MANAGER_0_TIMEOUT / portTICK_PERIOD_MS)
+    #define I2C_MANAGER_0_LOCK_TIMEOUT_TICKS (CONFIG_I2C_MANAGER_0_LOCK_TIMEOUT / portTICK_PERIOD_MS)
+#endif
+
+#ifdef I2C_ONE
+    #define I2C_MANAGER_1_TIMEOUT_TICKS (CONFIG_I2C_MANAGER_1_TIMEOUT / portTICK_PERIOD_MS)
+    #define I2C_MANAGER_1_LOCK_TIMEOUT_TICKS (CONFIG_I2C_MANAGER_1_LOCK_TIMEOUT / portTICK_PERIOD_MS)
+#endif
+
+// 错误处理宏
 #define ERROR_PORT(port, fail) { \
-	ESP_LOGE(TAG, "Invalid port or not configured for I2C Manager: %d", (int)port); \
-	return fail; \
+    ESP_LOGE(TAG, "Invalid port or not configured for I2C Manager: %d", (int)port); \
+    return fail; \
 }
 
-#if defined(I2C_ZERO) && defined (I2C_ONE)
-	#define I2C_PORT_CHECK(port, fail) \
-		if (port != I2C_NUM_0 && port != I2C_NUM_1) ERROR_PORT(port, fail);
+#if defined(I2C_ZERO) && defined(I2C_ONE)
+    #define I2C_PORT_CHECK(port, fail) \
+        if (port != I2C_NUM_0 && port != I2C_NUM_1) ERROR_PORT(port, fail);
 #else
-	#if defined(I2C_ZERO)
-		#define I2C_PORT_CHECK(port, fail) \
-			if (port != I2C_NUM_0) ERROR_PORT(port, fail);
-	#elif defined(I2C_ONE)
-		#define I2C_PORT_CHECK(port, fail) \
-			if (port != I2C_NUM_1) ERROR_PORT(port, fail);
-	#else
-		#define I2C_PORT_CHECK(port, fail) \
-			ERROR_PORT(port, fail);
-	#endif
+    #if defined(I2C_ZERO)
+        #define I2C_PORT_CHECK(port, fail) \
+            if (port != I2C_NUM_0) ERROR_PORT(port, fail);
+    #elif defined(I2C_ONE)
+        #define I2C_PORT_CHECK(port, fail) \
+            if (port != I2C_NUM_1) ERROR_PORT(port, fail);
+    #else
+        #define I2C_PORT_CHECK(port, fail) \
+            ERROR_PORT(port, fail);
+    #endif
 #endif
 
-static void i2c_send_address(i2c_cmd_handle_t cmd, uint16_t addr, i2c_rw_t rw) {
-	if (addr & I2C_ADDR_10) {
-		i2c_master_write_byte(cmd, 0xF0 | ((addr & 0x3FF) >> 7) | rw, ACK_CHECK_EN);
-		i2c_master_write_byte(cmd, addr & 0xFF, ACK_CHECK_EN);
-	} else {
-		i2c_master_write_byte(cmd, (addr << 1) | rw, ACK_CHECK_EN);
-	}
-}
-
-static void i2c_send_register(i2c_cmd_handle_t cmd, uint32_t reg) {
-	if (reg & I2C_REG_16) {
-	    i2c_master_write_byte(cmd, (reg & 0xFF00) >> 8, ACK_CHECK_EN);
-	}
-    i2c_master_write_byte(cmd, reg & 0xFF, ACK_CHECK_EN);
-}
-
-esp_err_t I2C_FN(_init)(i2c_port_t port) {
-
-	I2C_PORT_CHECK(port, ESP_FAIL);
-
-	esp_err_t ret = ESP_OK;
-
-	if (I2C_FN(_mutex)[port] == 0) {
-
-		ESP_LOGI(TAG, "Starting I2C master at port %d.", (int)port);
-
-		I2C_FN(_mutex)[port] = xSemaphoreCreateMutex();
-
-		i2c_config_t conf = {0};
-		
-		#ifdef HAS_CLK_FLAGS
-			conf.clk_flags = 0;
-		#endif
-
-		#if defined (I2C_ZERO)
-			if (port == I2C_NUM_0) {
-				conf.sda_io_num = CONFIG_I2C_MANAGER_0_SDA;
-				conf.scl_io_num = CONFIG_I2C_MANAGER_0_SCL;
-				conf.sda_pullup_en = I2C_MANAGER_0_PULLUPS ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
-				conf.scl_pullup_en = conf.sda_pullup_en;
-				conf.master.clk_speed = CONFIG_I2C_MANAGER_0_FREQ_HZ;
-			}
-		#endif
-
-		#if defined (I2C_ONE)
-			if (port == I2C_NUM_1) {
-				conf.sda_io_num = CONFIG_I2C_MANAGER_1_SDA;
-				conf.scl_io_num = CONFIG_I2C_MANAGER_1_SCL;
-				conf.sda_pullup_en = I2C_MANAGER_1_PULLUPS ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
-				conf.scl_pullup_en = conf.sda_pullup_en;
-				conf.master.clk_speed = CONFIG_I2C_MANAGER_1_FREQ_HZ;
-			}
-		#endif
-
-		conf.mode = I2C_MODE_MASTER;
-
-		ret = i2c_param_config(port, &conf);
-		ret |= i2c_driver_install(port, conf.mode, 0, 0, 0);
-
-		if (ret != ESP_OK) {
-			ESP_LOGE(TAG, "Failed to initialise I2C port %d.", (int)port);
-			ESP_LOGW(TAG, "If it was already open, we'll use it with whatever settings were used "
-			              "to open it. See I2C Manager README for details.");
-		} else {
-			ESP_LOGI(TAG, "Initialised port %d (SDA: %d, SCL: %d, speed: %d Hz.)",
-					 port, conf.sda_io_num, conf.scl_io_num, conf.master.clk_speed);
-		}
-
-	}
-
+// 获取设备句柄（如果不存在则创建）
+static esp_err_t get_device_handle(i2c_port_t port, uint16_t addr, i2c_master_dev_handle_t *dev_handle)
+{
+    i2c_manager_t *mgr = &i2c_managers[port];
+    
+    // 检查是否已存在该地址的设备句柄
+    uint8_t addr_index = addr & 0x7F; // 使用地址的低7位作为索引
+    if (mgr->dev_handles[addr_index] != NULL) {
+        *dev_handle = mgr->dev_handles[addr_index];
+        return ESP_OK;
+    }
+    
+    // 创建新的设备句柄
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = (addr & I2C_ADDR_10) ? I2C_ADDR_BIT_LEN_10 : I2C_ADDR_BIT_LEN_7,
+        .device_address = addr & 0x3FF,
+        .scl_speed_hz = mgr->clk_speed,
+    };
+    
+    esp_err_t ret = i2c_master_bus_add_device(mgr->bus_handle, &dev_cfg, &mgr->dev_handles[addr_index]);
+    if (ret == ESP_OK) {
+        *dev_handle = mgr->dev_handles[addr_index];
+    }
+    
     return ret;
 }
 
-esp_err_t I2C_FN(_read)(i2c_port_t port, uint16_t addr, uint32_t reg, uint8_t *buffer, uint16_t size) {
-
-	I2C_PORT_CHECK(port, ESP_FAIL);
-
-    esp_err_t result;
-
-    // May seem weird, but init starts with a check if it's needed, no need for that check twice.
-	I2C_FN(_init)(port);
-
-   	ESP_LOGV(TAG, "Reading port %d, addr 0x%03x, reg 0x%04x", port, addr, reg);
-
-	TickType_t timeout = 0;
-	#if defined (I2C_ZERO)
-		if (port == I2C_NUM_0) {
-			timeout = I2C_MANAGER_0_TIMEOUT;
-		}
-	#endif
-	#if defined (I2C_ONE)
-		if (port == I2C_NUM_1) {
-			timeout = I2C_MANAGER_1_TIMEOUT;
-		}
-	#endif
-
-	if (I2C_FN(_lock)((int)port) == ESP_OK) {
-		i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-		if (!(reg & I2C_NO_REG)) {
-			/* When reading specific register set the addr pointer first. */
-			i2c_master_start(cmd);
-			i2c_send_address(cmd, addr, I2C_MASTER_WRITE);
-			i2c_send_register(cmd, reg);
-		}
-		/* Read size bytes from the current pointer. */
-		i2c_master_start(cmd);
-		i2c_send_address(cmd, addr, I2C_MASTER_READ);
-		i2c_master_read(cmd, buffer, size, I2C_MASTER_LAST_NACK);
-		i2c_master_stop(cmd);
-		result = i2c_master_cmd_begin(port, cmd, timeout);
-		i2c_cmd_link_delete(cmd);
-		I2C_FN(_unlock)((int)port);
-	} else {
-		ESP_LOGE(TAG, "Lock could not be obtained for port %d.", (int)port);
-		return ESP_ERR_TIMEOUT;
-	}
-
-    if (result != ESP_OK) {
-    	ESP_LOGW(TAG, "Error: %d", result);
+// 初始化I2C管理器
+esp_err_t I2C_FN(_init)(i2c_port_t port)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    i2c_manager_t *mgr = &i2c_managers[port];
+    
+    if (mgr->initialized) {
+        return ESP_OK; // 已经初始化
     }
-
-	ESP_LOG_BUFFER_HEX_LEVEL(TAG, buffer, size, ESP_LOG_VERBOSE);
-
-    return result;
-}
-
-esp_err_t I2C_FN(_write)(i2c_port_t port, uint16_t addr, uint32_t reg, const uint8_t *buffer, uint16_t size) {
-
-	I2C_PORT_CHECK(port, ESP_FAIL);
-
-    esp_err_t result;
-
-    // May seem weird, but init starts with a check if it's needed, no need for that check twice.
-	I2C_FN(_init)(port);
-
-    ESP_LOGV(TAG, "Writing port %d, addr 0x%03x, reg 0x%04x", port, addr, reg);
-
-	TickType_t timeout = 0;
-	#if defined (I2C_ZERO)
-		if (port == I2C_NUM_0) {
-			timeout = (CONFIG_I2C_MANAGER_0_TIMEOUT) / portTICK_RATE_MS;
-		}
-	#endif
-	#if defined (I2C_ONE)
-		if (port == I2C_NUM_1) {
-			timeout = (CONFIG_I2C_MANAGER_1_TIMEOUT) / portTICK_RATE_MS;
-		}
-	#endif
-
-	if (I2C_FN(_lock)((int)port) == ESP_OK) {
-		i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-		i2c_master_start(cmd);
-		i2c_send_address(cmd, addr, I2C_MASTER_WRITE);
-		if (!(reg & I2C_NO_REG)) {
-			i2c_send_register(cmd, reg);
-		}
-		i2c_master_write(cmd, (uint8_t *)buffer, size, ACK_CHECK_EN);
-		i2c_master_stop(cmd);
-		result = i2c_master_cmd_begin( port, cmd, timeout);
-		i2c_cmd_link_delete(cmd);
-		I2C_FN(_unlock)((int)port);
-	} else {
-		ESP_LOGE(TAG, "Lock could not be obtained for port %d.", (int)port);
-		return ESP_ERR_TIMEOUT;
-	}
-
-    if (result != ESP_OK) {
-    	ESP_LOGW(TAG, "Error: %d", result);
+    
+    esp_err_t ret = ESP_OK;
+    
+    // 创建互斥锁
+    mgr->mutex = xSemaphoreCreateMutex();
+    if (mgr->mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create mutex for port %d", port);
+        return ESP_ERR_NO_MEM;
     }
-
-	ESP_LOG_BUFFER_HEX_LEVEL(TAG, buffer, size, ESP_LOG_VERBOSE);
-
-    return result;
-}
-
-esp_err_t I2C_FN(_close)(i2c_port_t port) {
-	I2C_PORT_CHECK(port, ESP_FAIL);
-    vSemaphoreDelete(I2C_FN(_mutex)[port]);
-    I2C_FN(_mutex)[port] = NULL;
-    ESP_LOGI(TAG, "Closing I2C master at port %d", port);
-    return i2c_driver_delete(port);
-}
-
-esp_err_t I2C_FN(_lock)(i2c_port_t port) {
-	I2C_PORT_CHECK(port, ESP_FAIL);
-	ESP_LOGV(TAG, "Mutex lock set for %d.", (int)port);
-
-	TickType_t timeout;
-	#if defined (I2C_ZERO)
-		if (port == I2C_NUM_0) {
-			timeout = (CONFIG_I2C_MANAGER_0_LOCK_TIMEOUT) / portTICK_RATE_MS;
-		}
-	#endif
-	#if defined (I2C_ONE)
-		if (port == I2C_NUM_1) {
-			timeout = (CONFIG_I2C_MANAGER_1_LOCK_TIMEOUT) / portTICK_RATE_MS;
-		}
-	#endif
-
-	if (xSemaphoreTake(I2C_FN(_mutex)[port], timeout) == pdTRUE) {
-		return ESP_OK;
-	} else {
-		ESP_LOGE(TAG, "Removing stale mutex lock from port %d.", (int)port);
-		I2C_FN(_force_unlock)(port);
-		return (xSemaphoreTake(I2C_FN(_mutex)[port], timeout) == pdTRUE ? ESP_OK : ESP_FAIL);
-	}
-}
-
-esp_err_t I2C_FN(_unlock)(i2c_port_t port) {
-	I2C_PORT_CHECK(port, ESP_FAIL);
-	ESP_LOGV(TAG, "Mutex lock removed for %d.", (int)port);
-	return (xSemaphoreGive(I2C_FN(_mutex)[port]) == pdTRUE) ? ESP_OK : ESP_FAIL;
-}
-
-esp_err_t I2C_FN(_force_unlock)(i2c_port_t port) {
-	I2C_PORT_CHECK(port, ESP_FAIL);
-	if (I2C_FN(_mutex)[port]) {
-		vSemaphoreDelete(I2C_FN(_mutex)[port]);
-	}
-	I2C_FN(_mutex)[port] = xSemaphoreCreateMutex();
-	return ESP_OK;
-}
-
-
-
-#ifdef I2C_OEM
-
-    void I2C_FN(_locking)(void* leader) {
-        if (leader) {
-            ESP_LOGI(TAG, "Now following I2C Manager for locking");
-            I2C_FN(_mutex) = (SemaphoreHandle_t*)leader;
-		}
-    }
-
-#else
-
-    void* i2c_manager_locking() {
-        return (void*)i2c_manager_mutex;
-    }
-
-    int32_t i2c_hal_read(void *handle, uint8_t address, uint8_t reg, uint8_t *buffer, uint16_t size) {
-        return i2c_manager_read(*(i2c_port_t*)handle, address, reg, buffer, size);
-    }
-
-    int32_t i2c_hal_write(void *handle, uint8_t address, uint8_t reg, const uint8_t *buffer, uint16_t size) {
-        return i2c_manager_write(*(i2c_port_t*)handle, address, reg, buffer, size);
-    }
-
-	static i2c_port_t port_zero = (i2c_port_t)0;
-	static i2c_port_t port_one = (i2c_port_t)1;
-
-    static i2c_hal_t _i2c_hal[2] = {
-        {&i2c_hal_read, &i2c_hal_write, &port_zero},
-        {&i2c_hal_read, &i2c_hal_write, &port_one}
+    
+    // 配置I2C总线
+    i2c_master_bus_config_t i2c_mst_config = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = port,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-
-    void* i2c_hal(i2c_port_t port) {
-		I2C_PORT_CHECK(port, NULL);
-        return (void*)&_i2c_hal[port];
+    
+    // 根据端口设置GPIO和频率
+    if (port == I2C_NUM_0) {
+#ifdef I2C_ZERO
+        i2c_mst_config.scl_io_num = CONFIG_I2C_MANAGER_0_SCL;
+        i2c_mst_config.sda_io_num = CONFIG_I2C_MANAGER_0_SDA;
+        mgr->clk_speed = CONFIG_I2C_MANAGER_0_FREQ_HZ;
+        mgr->scl_io_num = CONFIG_I2C_MANAGER_0_SCL;
+        mgr->sda_io_num = CONFIG_I2C_MANAGER_0_SDA;
+#endif
+    } else if (port == I2C_NUM_1) {
+#ifdef I2C_ONE
+        i2c_mst_config.scl_io_num = CONFIG_I2C_MANAGER_1_SCL;
+        i2c_mst_config.sda_io_num = CONFIG_I2C_MANAGER_1_SDA;
+        mgr->clk_speed = CONFIG_I2C_MANAGER_1_FREQ_HZ;
+        mgr->scl_io_num = CONFIG_I2C_MANAGER_1_SCL;
+        mgr->sda_io_num = CONFIG_I2C_MANAGER_1_SDA;
+#endif
     }
+    
+    // 创建I2C主机总线
+    ret = i2c_new_master_bus(&i2c_mst_config, &mgr->bus_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create I2C master bus for port %d: %s", port, esp_err_to_name(ret));
+        vSemaphoreDelete(mgr->mutex);
+        mgr->mutex = NULL;
+        return ret;
+    }
+    
+    mgr->initialized = true;
+    
+    ESP_LOGI(TAG, "I2C Manager initialized for port %d (SDA: %lu, SCL: %lu, speed: %lu Hz)",
+             port, mgr->sda_io_num, mgr->scl_io_num, mgr->clk_speed);
+    
+    return ESP_OK;
+}
+
+// 读取数据
+esp_err_t I2C_FN(_read)(i2c_port_t port, uint16_t addr, uint32_t reg, uint8_t *buffer, uint16_t size)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    if (buffer == NULL || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 确保初始化
+    esp_err_t ret = I2C_FN(_init)(port);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    ESP_LOGV(TAG, "Reading port %d, addr 0x%03x, reg 0x%08lx", port, addr, reg);
+    
+    i2c_master_dev_handle_t dev_handle;
+    ret = get_device_handle(port, addr, &dev_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get device handle for addr 0x%02x", addr);
+        return ret;
+    }
+    
+    // 获取超时时间
+    TickType_t timeout = pdMS_TO_TICKS(1000); // 默认1秒
+#ifdef I2C_ZERO
+    if (port == I2C_NUM_0) {
+        timeout = I2C_MANAGER_0_TIMEOUT_TICKS;
+    }
+#endif
+#ifdef I2C_ONE
+    if (port == I2C_NUM_1) {
+        timeout = I2C_MANAGER_1_TIMEOUT_TICKS;
+    }
+#endif
+    
+    // 获取锁
+    if (I2C_FN(_lock)(port) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to acquire lock for port %d", port);
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    // 执行I2C传输
+    if (!(reg & I2C_NO_REG)) {
+        // 需要先写寄存器地址
+        uint8_t reg_buf[4];
+        int reg_len = 1;
+        
+        if (reg & I2C_REG_16) {
+            reg_buf[0] = (reg >> 8) & 0xFF;
+            reg_buf[1] = reg & 0xFF;
+            reg_len = 2;
+        } else {
+            reg_buf[0] = reg & 0xFF;
+        }
+        
+        ret = i2c_master_transmit_receive(dev_handle, reg_buf, reg_len, buffer, size, timeout);
+    } else {
+        // 直接读取
+        ret = i2c_master_receive(dev_handle, buffer, size, timeout);
+    }
+    
+    I2C_FN(_unlock)(port);
+    
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "I2C read failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, buffer, size, ESP_LOG_VERBOSE);
+    }
+    
+    return ret;
+}
+
+// 写入数据
+esp_err_t I2C_FN(_write)(i2c_port_t port, uint16_t addr, uint32_t reg, const uint8_t *buffer, uint16_t size)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    if (buffer == NULL || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 确保初始化
+    esp_err_t ret = I2C_FN(_init)(port);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    ESP_LOGV(TAG, "Writing port %d, addr 0x%03x, reg 0x%08lx", port, addr, reg);
+    
+    i2c_master_dev_handle_t dev_handle;
+    ret = get_device_handle(port, addr, &dev_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get device handle for addr 0x%02x", addr);
+        return ret;
+    }
+    
+    // 获取超时时间
+    TickType_t timeout = pdMS_TO_TICKS(1000); // 默认1秒
+#ifdef I2C_ZERO
+    if (port == I2C_NUM_0) {
+        timeout = I2C_MANAGER_0_TIMEOUT_TICKS;
+    }
+#endif
+#ifdef I2C_ONE
+    if (port == I2C_NUM_1) {
+        timeout = I2C_MANAGER_1_TIMEOUT_TICKS;
+    }
+#endif
+    
+    // 获取锁
+    if (I2C_FN(_lock)(port) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to acquire lock for port %d", port);
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, buffer, size, ESP_LOG_VERBOSE);
+    
+    // 执行I2C传输
+    if (!(reg & I2C_NO_REG)) {
+        // 需要写寄存器地址 + 数据
+        uint8_t *write_buf = malloc(size + 4); // 最多4字节寄存器地址
+        if (write_buf == NULL) {
+            I2C_FN(_unlock)(port);
+            return ESP_ERR_NO_MEM;
+        }
+        
+        int reg_len = 1;
+        if (reg & I2C_REG_16) {
+            write_buf[0] = (reg >> 8) & 0xFF;
+            write_buf[1] = reg & 0xFF;
+            reg_len = 2;
+        } else {
+            write_buf[0] = reg & 0xFF;
+        }
+        
+        memcpy(&write_buf[reg_len], buffer, size);
+        ret = i2c_master_transmit(dev_handle, write_buf, reg_len + size, timeout);
+        
+        free(write_buf);
+    } else {
+        // 直接写入数据
+        ret = i2c_master_transmit(dev_handle, buffer, size, timeout);
+    }
+    
+    I2C_FN(_unlock)(port);
+    
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "I2C write failed: %s", esp_err_to_name(ret));
+    }
+    
+    return ret;
+}
+
+// 关闭I2C管理器
+esp_err_t I2C_FN(_close)(i2c_port_t port)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    i2c_manager_t *mgr = &i2c_managers[port];
+    
+    if (!mgr->initialized) {
+        return ESP_OK; // 已经关闭
+    }
+    
+    // 删除所有设备句柄
+    for (int i = 0; i < 128; i++) {
+        if (mgr->dev_handles[i] != NULL) {
+            i2c_master_bus_rm_device(mgr->dev_handles[i]);
+            mgr->dev_handles[i] = NULL;
+        }
+    }
+    
+    // 删除I2C总线
+    if (mgr->bus_handle != NULL) {
+        i2c_del_master_bus(mgr->bus_handle);
+        mgr->bus_handle = NULL;
+    }
+    
+    // 删除互斥锁
+    if (mgr->mutex != NULL) {
+        vSemaphoreDelete(mgr->mutex);
+        mgr->mutex = NULL;
+    }
+    
+    mgr->initialized = false;
+    
+    ESP_LOGI(TAG, "I2C Manager closed for port %d", port);
+    
+    return ESP_OK;
+}
+
+// 获取锁
+esp_err_t I2C_FN(_lock)(i2c_port_t port)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    i2c_manager_t *mgr = &i2c_managers[port];
+    
+    if (!mgr->initialized || mgr->mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    TickType_t timeout = portMAX_DELAY;
+#ifdef I2C_ZERO
+    if (port == I2C_NUM_0) {
+        timeout = I2C_MANAGER_0_LOCK_TIMEOUT_TICKS;
+    }
+#endif
+#ifdef I2C_ONE
+    if (port == I2C_NUM_1) {
+        timeout = I2C_MANAGER_1_LOCK_TIMEOUT_TICKS;
+    }
+#endif
+    
+    if (xSemaphoreTake(mgr->mutex, timeout) == pdTRUE) {
+        return ESP_OK;
+    } else {
+        ESP_LOGW(TAG, "Failed to acquire lock for port %d within timeout", port);
+        return ESP_ERR_TIMEOUT;
+    }
+}
+
+// 释放锁
+esp_err_t I2C_FN(_unlock)(i2c_port_t port)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    i2c_manager_t *mgr = &i2c_managers[port];
+    
+    if (!mgr->initialized || mgr->mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (xSemaphoreGive(mgr->mutex) == pdTRUE) {
+        return ESP_OK;
+    } else {
+        ESP_LOGW(TAG, "Failed to release lock for port %d", port);
+        return ESP_ERR_INVALID_STATE;
+    }
+}
+
+// 强制释放锁
+esp_err_t I2C_FN(_force_unlock)(i2c_port_t port)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    i2c_manager_t *mgr = &i2c_managers[port];
+    
+    if (!mgr->initialized || mgr->mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // 强制释放锁 - 注意这可能会导致竞态条件
+    xSemaphoreGive(mgr->mutex);
+    
+    ESP_LOGW(TAG, "Forced unlock for port %d", port);
+    
+    return ESP_OK;
+}
+
+// 获取I2C管理器句柄 (用于高级用法)
+i2c_master_bus_handle_t i2c_manager_get_bus_handle(i2c_port_t port)
+{
+    if (port >= I2C_NUM_MAX) {
+        return NULL;
+    }
+    
+    i2c_manager_t *mgr = &i2c_managers[port];
+    
+    if (!mgr->initialized) {
+        // 尝试初始化
+        if (I2C_FN(_init)(port) != ESP_OK) {
+            return NULL;
+        }
+    }
+    
+    return mgr->bus_handle;
+}
+
+// 获取设备句柄 (用于高级用法)
+esp_err_t i2c_manager_get_device_handle(i2c_port_t port, uint16_t addr, i2c_master_dev_handle_t *dev_handle)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    if (dev_handle == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 确保初始化
+    esp_err_t ret = I2C_FN(_init)(port);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    return get_device_handle(port, addr, dev_handle);
+}
+
+// 探测I2C设备 - 修复版本
+esp_err_t i2c_manager_probe_device(i2c_port_t port, uint16_t addr)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    // 确保初始化
+    esp_err_t ret = I2C_FN(_init)(port);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    i2c_manager_t *mgr = &i2c_managers[port];
+    
+    // 获取锁
+    if (I2C_FN(_lock)(port) != ESP_OK) {
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    // 使用总线句柄进行探测，而不是设备句柄
+    ret = i2c_master_probe(mgr->bus_handle, addr & 0x7F, 100); // 100ms 超时
+    
+    I2C_FN(_unlock)(port);
+    
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Device found at address 0x%02x on port %d", addr, port);
+    } else {
+        ESP_LOGD(TAG, "No device found at address 0x%02x on port %d", addr, port);
+    }
+    
+    return ret;
+}
+
+// 扫描I2C总线上的所有设备
+esp_err_t i2c_manager_scan_bus(i2c_port_t port, uint8_t *found_devices, size_t max_devices, size_t *num_found)
+{
+    I2C_PORT_CHECK(port, ESP_FAIL);
+    
+    if (found_devices == NULL || num_found == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    *num_found = 0;
+    
+    ESP_LOGI(TAG, "Scanning I2C bus on port %d...", port);
+    
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) { // 标准I2C地址范围
+        if (*num_found >= max_devices) {
+            break;
+        }
+        
+        if (i2c_manager_probe_device(port, addr) == ESP_OK) {
+            found_devices[*num_found] = addr;
+            (*num_found)++;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10)); // 小延时避免总线拥塞
+    }
+    
+    ESP_LOGI(TAG, "I2C scan complete. Found %d devices on port %d", *num_found, port);
+    
+    return ESP_OK;
+}
+
+#ifndef I2C_OEM
+// 兼容性函数 - 如果不是OEM版本，提供标准接口
+void* i2c_manager_locking(void)
+{
+    // 返回锁管理函数指针 - 这里简化实现
+    return NULL;
+}
+
+void* i2c_hal(i2c_port_t port)
+{
+    // HAL接口 - 这里简化实现
+    return i2c_manager_get_bus_handle(port);
+}
 
 #endif
