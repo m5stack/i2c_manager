@@ -1,5 +1,6 @@
 config HAVE_I2C_MANAGER
-def_bool y
+    bool "Have I2C manager"
+    default y
 
 menu "I2C Port Settings"
 
